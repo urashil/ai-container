@@ -12,8 +12,9 @@
 # container sync [--host]  copy the Claude Code sign-in from this machine into the box (--host: from the box to this machine)
 # container git [on|off]   hand the box your git identity + GitHub push access (your gh token, used only as git's credential)
 # container gh [on|off]    hand the box the gh CLI sign-in (GH_TOKEN): deploy logs, Actions runs, PRs
+# container clipboard [on|off]  share images you copy with running boxes, so they paste into Claude Code (default on). Never text.
 # container status         what the boxes get
-#   one run only: container [--git|--no-git] [--gh|--no-gh] [command...]
+#   one run only: container [--git|--no-git] [--gh|--no-gh] [--clipboard|--no-clipboard] [command...]
 set -euo pipefail
 
 BASE=/var/lib/aibox
@@ -108,20 +109,64 @@ toggle() {   # toggle git|gh [on|off]
         "") ;;
         *) die "usage: container $1 [on|off]" ;;
     esac
-    echo "$1: $(setting "$1" || true)" | sed 's/: $/: off/'
+    if [ "$1" = clipboard ]; then echo "clipboard: $(setting clipboard | grep . || echo on)"
+    else echo "$1: $(setting "$1" | grep . || echo off)"; fi
+}
+
+# the clipboard's image, if it holds one, as $1/clipboard.png; anything else removes the file, so text is never shared
+clip_update() {
+    local dir=$1 types type
+    types=$(wl-paste --list-types 2>/dev/null || true)
+    type=$(printf '%s\n' "$types" | grep -m1 -xF image/png || printf '%s\n' "$types" | grep -m1 -E '^image/(jpeg|jpg|gif|webp|bmp)$' || true)
+    if [ -z "$type" ]; then rm -f "$dir/clipboard.png"; return 0; fi
+    if [ "$type" = image/png ]; then wl-paste --type image/png > "$dir/clipboard.tmp"
+    else wl-paste --type "$type" | magick - png:- > "$dir/clipboard.tmp"; fi
+    if [ -s "$dir/clipboard.tmp" ]; then mv "$dir/clipboard.tmp" "$dir/clipboard.png"; else rm -f "$dir/clipboard.tmp" "$dir/clipboard.png"; fi
+}
+
+# inside the box: a stand-in wl-paste (first on PATH) that serves only that file, and a shell that keeps it first on PATH
+clip_share() {
+    [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null || return 0
+    mkdir -m 700 "$SECRETS/bin"
+    cat > "$SECRETS/bin/wl-paste" <<'EOF'
+#!/bin/sh
+# only images are shared with the box: see `container clipboard`
+f=/run/aibox/clipboard.png
+case "$*" in
+    -l|--list-types) [ -s "$f" ] && echo image/png ;;
+    "-t image/png"|"--type image/png"|"--type=image/png") [ -s "$f" ] && exec cat "$f" ;;
+    *) false ;;
+esac
+EOF
+    chmod 700 "$SECRETS/bin/wl-paste"
+    cat > "$SECRETS/bashrc" <<'EOF'
+. /etc/profile
+[ -f ~/.bashrc ] && . ~/.bashrc
+export PATH="/run/aibox/bin:$PATH"
+EOF
+    clip_update "$SECRETS"
+    # the watcher's command runs this script again, once per clipboard change
+    wl-paste --watch "$0" _clip "$SECRETS" </dev/null >/dev/null 2>&1 &
+    CLIP_PID=$!
 }
 
 # the credentials the box gets this time, in a private folder on the user's tmpfs, mounted read-only at /run/aibox
 SECRETS=""
-cleanup() { [ -n "$SECRETS" ] && rm -rf "$SECRETS"; }
+CLIP_PID=""
+cleanup() {
+    [ -z "$CLIP_PID" ] || kill "$CLIP_PID" 2>/dev/null || true
+    [ -z "$SECRETS" ] || rm -rf "$SECRETS"
+}
 secrets() {
-    local git=$1 gh=$2
-    [ "$git" = on ] || [ "$gh" = on ] || return 0
-    command -v gh >/dev/null || die "gh is not installed here"
-    local token; token=$(gh auth token 2>/dev/null) || die "gh is not signed in here (gh auth login)"
+    local git=$1 gh=$2 clip=$3
+    [ "$git" = on ] || [ "$gh" = on ] || [ "$clip" = on ] || return 0
     SECRETS="/run/user/$(id -u)/aibox-$$"
     trap cleanup EXIT
     (umask 077; mkdir "$SECRETS")
+    [ "$clip" != on ] || clip_share
+    [ "$git" = on ] || [ "$gh" = on ] || return 0
+    command -v gh >/dev/null || die "gh is not installed here"
+    local token; token=$(gh auth token 2>/dev/null) || die "gh is not signed in here (gh auth login)"
     if [ "$git" = on ]; then
         (umask 077; printf '%s\n' "$token" > "$SECRETS/git-token")
         local name email; name=$(git config --global user.name || true); email=$(git config --global user.email || true)
@@ -143,8 +188,9 @@ EOF
 
 case "${1:-}" in
     setup) setup ;;
-    git|gh) toggle "$1" "${2:-}" ;;
-    status) echo "git: $(setting git | grep . || echo off)"; echo "gh: $(setting gh | grep . || echo off)" ;;
+    git|gh|clipboard) toggle "$1" "${2:-}" ;;
+    _clip) cat >/dev/null; clip_update "$2" ;;      # internal: the clipboard changed
+    status) toggle git; toggle gh; toggle clipboard ;;
     reset)
         check
         all=0; [ "${2:-}" = --all ] && all=1
@@ -153,19 +199,24 @@ case "${1:-}" in
         exec sudo "$HELPER" fill "$([ $all = 1 ] && echo all || echo keep)" ;;
     sync) check; sync_claude "${2:-}" ;;
     df) check; df -h "$ROOT" | tail -1 ;;
-    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)
         check
-        git=$(setting git); gh=$(setting gh)
+        git=$(setting git); gh=$(setting gh); clip=$(setting clipboard)
         while [ $# -gt 0 ]; do
             case "$1" in
                 --git) git=on ;; --no-git) git=off ;;
                 --gh) gh=on ;; --no-gh) gh=off ;;
+                --clipboard) clip=on ;; --no-clipboard) clip=off ;;
                 *) break ;;
             esac
             shift
         done
-        secrets "${git:-off}" "${gh:-off}"
+        secrets "${git:-off}" "${gh:-off}" "${clip:-on}"
+        if [ -n "$SECRETS" ] && [ -d "$SECRETS/bin" ]; then
+            if [ $# -eq 0 ]; then set -- bash --rcfile /run/aibox/bashrc -i
+            else set -- sh -c 'PATH="/run/aibox/bin:$PATH" exec "$@"' _ "$@"; fi
+        fi
         # not exec: the credentials folder is removed when the box ends
         sudo "$HELPER" box ${SECRETS:+--secrets "$SECRETS"} -- "$@" ;;
 esac

@@ -28,10 +28,13 @@ container claude [args]        any command
 container sync [--host]        copy the Claude Code sign-in into the box (--host: back out)
 container git on|off           give boxes your git identity + GitHub push (gh token as git credential)
 container gh on|off            give boxes the gh CLI sign-in (GH_TOKEN)
-container --git --no-gh ...    for one run only
+container clipboard on|off     share images you copy with running boxes, so Ctrl+V works in Claude Code (default on)
+container --git --no-gh ...    for one run only (also --clipboard / --no-clipboard)
 container status | df          switches | space used in the shared root
 container reset [--all]        rebuild the shared root from fresh Alpine (keeps /home unless --all)
 ```
 
 Credentials handed over with `git` / `gh` live in a private tmpfs folder mounted read-only into that box only, and are removed
-when it ends. Your `~/.ssh` is never mounted. The box refuses to start in `/`, `/home` or your home folder itself.
+when it ends. Your `~/.ssh` is never mounted.
+The clipboard share never exposes text or the Wayland socket: only the current clipboard image, as a read-only file, and only
+while a box is open. The box refuses to start in `/`, `/home` or your home folder itself.
