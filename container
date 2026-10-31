@@ -85,22 +85,51 @@ check() {
     mountpoint -q "$ROOT" || die "$ROOT is not mounted: run 'container setup'"
 }
 
-# the Claude Code sign-in: the token file, plus the account fields of ~/.claude.json (the rest of each side's settings stays)
+# the Claude Code sign-in: the token file, plus the account fields of ~/.claude.json (the rest of each side's settings stays).
+# The box's home is the agent's to rearrange, so this machine never opens a path in it (a planted symlink would send a write or
+# a read anywhere in your home). A throwaway box does its side of the copy, through a private folder, and has ended before
+# anything it left there is read here.
+SYNC_INTO_BOX='
+set -e
+mkdir -p "$HOME/.claude"
+rm -f "$HOME/.claude/.credentials.json"
+install -m 600 "$PWD/creds" "$HOME/.claude/.credentials.json"
+if [ -f "$HOME/.claude.json" ]; then jq -s ".[0] + .[1]" "$HOME/.claude.json" "$PWD/acct" > "$PWD/merged"; else cp "$PWD/acct" "$PWD/merged"; fi
+rm -f "$HOME/.claude.json"
+install -m 600 "$PWD/merged" "$HOME/.claude.json"
+'
+SYNC_OUT_OF_BOX='
+set -e
+[ -f "$HOME/.claude/.credentials.json" ] || { echo "not signed in to Claude Code in the box" >&2; exit 3; }
+cat "$HOME/.claude/.credentials.json" > "$PWD/creds"
+jq "{oauthAccount, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))" "$HOME/.claude.json" > "$PWD/acct"
+'
+SYNC_DIR=""
 sync_claude() {
-    local box="$ROOT/home/$ME" from to
-    [ -d "$box" ] || die "the box has no home yet: run 'container true' first"
-    if [ "${1:-}" = --host ]; then from=$box; to=$HOME; else from=$HOME; to=$box; fi
-    [ -f "$from/.claude/.credentials.json" ] || die "not signed in to Claude Code in ${from/#$box/the box}"
-    mkdir -p "$to/.claude"
-    install -m 600 "$from/.claude/.credentials.json" "$to/.claude/.credentials.json"
-    local acct; acct=$(jq '{oauthAccount, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))' "$from/.claude.json")
-    if [ -f "$to/.claude.json" ]; then
-        jq --argjson a "$acct" '. + $a' "$to/.claude.json" > "$to/.claude.json.tmp"
+    SYNC_DIR=$(mktemp -d "/run/user/$(id -u)/aibox-sync.XXXXXX")
+    trap '[ -z "$SYNC_DIR" ] || rm -rf "$SYNC_DIR"' EXIT
+    cd "$SYNC_DIR"
+    if [ "${1:-}" = --host ]; then
+        sudo "$HELPER" box -- bash -c "$SYNC_OUT_OF_BOX" </dev/null
+        # what came out is untrusted: plain files of a sane size holding JSON objects, or nothing is touched here
+        local f
+        for f in creds acct; do
+            [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %u "$f")" = "$(id -u)" ] && [ "$(stat -c %s "$f")" -lt 1048576 ] \
+                && jq -e 'type == "object"' "$f" >/dev/null || die "the box returned a bad $f; nothing changed"
+        done
+        mkdir -p "$HOME/.claude"
+        install -m 600 creds "$HOME/.claude/.credentials.json"
+        if [ -f "$HOME/.claude.json" ]; then jq -s '.[0] + .[1]' "$HOME/.claude.json" acct > merged; else cp acct merged; fi
+        chmod 600 merged && mv merged "$HOME/.claude.json"
+        echo "Claude Code sign-in copied from the box to this machine"
     else
-        printf '%s\n' "$acct" > "$to/.claude.json.tmp"
+        [ -f "$HOME/.claude/.credentials.json" ] || die "not signed in to Claude Code on this machine"
+        (umask 077
+         cp "$HOME/.claude/.credentials.json" creds
+         jq '{oauthAccount, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))' "$HOME/.claude.json" > acct)
+        sudo "$HELPER" box -- bash -c "$SYNC_INTO_BOX" </dev/null
+        echo "Claude Code sign-in copied into the box"
     fi
-    chmod 600 "$to/.claude.json.tmp" && mv "$to/.claude.json.tmp" "$to/.claude.json"
-    echo "Claude Code sign-in copied $([ "${1:-}" = --host ] && echo 'from the box to this machine' || echo 'into the box')"
 }
 
 toggle() {   # toggle git|gh [on|off]
